@@ -4,8 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 import numpy as np
-from gcode_sender import send_gcode
-
+from gcode_sender import send_gcode, emergency_stop_socket, return_to_start
 
 class PlotterUI:
     """
@@ -18,6 +17,10 @@ class PlotterUI:
     """
 
     def __init__(self, algorithm):
+
+        self.send_thread = None
+        self.stop_send_event = threading.Event()
+
         self.alg = algorithm
         self.root = tk.Tk()
         self.root.title("Plotter Demo - Stage Presentation")
@@ -54,14 +57,38 @@ class PlotterUI:
             messagebox.showwarning("No G-code", "Run All first.")
             return
 
-        ip = "192.168.4.1"  # default ESP32 AP IP
-        port = 23  # GRBL-ESP32 Telnet
+        if self.send_thread and self.send_thread.is_alive():
+            messagebox.showinfo("Busy", "Already sending.")
+            return
 
-        try:
-            send_gcode(ip, port, self.last_gcode)
-            messagebox.showinfo("Success", "G-code sent!")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        ip = "192.168.4.1"
+        port = 23
+
+        self.stop_send_event.clear()
+        self._set_stats("Sending G-code...\n")
+
+        def worker():
+            try:
+                finished = send_gcode(
+                    ip,
+                    port,
+                    self.last_gcode,
+                    stop_event=self.stop_send_event
+                )
+
+                if finished:
+                    try:
+                        return_to_start()
+                    except Exception as e:
+                        print("Return home after finish failed:", e)
+
+                    self.worker_q.put(("send_ok", "G-code finished and returned home."))
+
+            except Exception as e:
+                self.worker_q.put(("err", str(e)))
+
+        self.send_thread = threading.Thread(target=worker, daemon=True)
+        self.send_thread.start()
 
     # ---------------- UI Layout ----------------
 
@@ -256,7 +283,7 @@ class PlotterUI:
             messagebox.showinfo("Busy", "Processing is still running...")
             return
 
-        self.on_stop()
+        self.stop_animation_only()
         self._apply_params_to_alg()
         self._set_stats("Processing in background...\n")
 
@@ -286,21 +313,52 @@ class PlotterUI:
         messagebox.showinfo("Saved", f"Saved:\n{fp}")
 
     def on_play(self):
-        if not self.last_polylines or not self.last_size:
+        if self.last_polylines is None or self.last_size is None:
             messagebox.showwarning("No data", "Run All first.")
             return
+
+        if len(self.last_polylines) == 0:
+            messagebox.showwarning("No lines", "Run All finished, but no drawable contours were found.")
+            return
+
         self._build_anim_stream()
         self._reset_anim_canvas()
         self.anim_i = 0
         self._animate_tick()
 
     def on_stop(self):
+        self.stop_send_event.set()
+
+        try:
+            emergency_stop_socket()
+        except Exception as e:
+            print("Emergency stop failed:", e)
+
+        self.root.after(1000, self._return_home_after_stop)
+
+        if self.anim_job is not None:
+            try:
+                self.root.after_cancel(self.anim_job)
+            except Exception:
+                pass
+
+        self.anim_job = None
+        self._set_stats("Stop pressed. Clearing buffer, then returning home...\n")
+
+    def stop_animation_only(self):
         if self.anim_job is not None:
             try:
                 self.root.after_cancel(self.anim_job)
             except Exception:
                 pass
         self.anim_job = None
+
+    def _return_home_after_stop(self):
+        try:
+            return_to_start()
+            self._set_stats("Stopped and returned to start position.\n")
+        except Exception as e:
+            self._set_stats(f"Stopped, but return home failed:\n{e}\n")
 
     # ---------------- Worker poll ----------------
 
@@ -311,9 +369,18 @@ class PlotterUI:
             self.root.after(50, self._poll_worker_queue)
             return
 
-        if msg == "err":
+        if msg == "send_ok":
+            self._set_stats(payload + "\n")
+            messagebox.showinfo("Success", payload)
+
+        elif msg == "send_stop":
+            self._set_stats(payload + "\n")
+            messagebox.showinfo("Stopped", payload)
+
+        elif msg == "err":
             self._set_stats("Error:\n" + payload + "\n")
             messagebox.showerror("Run failed", payload)
+
         else:
             img, edges, overlay, polylines, gcode, stats = payload
             self.last_polylines = polylines
