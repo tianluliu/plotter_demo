@@ -12,7 +12,7 @@ class AlgoParams:
     canny2: int = 150
     min_contour_len: int = 80
     simplify_eps: float = 1.5
-    mm_per_pixel: float = 0.2
+    mm_per_pixel: float = 0.390625
 
     # G-code / time estimate parameters
     feed_g0: float = 3000.0   # mm/min
@@ -48,14 +48,32 @@ class PlotterAlgorithm:
 
     def _contours_to_polylines(self, edges: np.ndarray) -> List[np.ndarray]:
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+
         polylines: List[np.ndarray] = []
+
         for c in contours:
             if len(c) < int(self.params.min_contour_len):
                 continue
-            approx = cv2.approxPolyDP(c, epsilon=float(self.params.simplify_eps), closed=False)
+
+            # Detect whether contour is closed
+            closed = True
+
+            approx = cv2.approxPolyDP(
+                c,
+                epsilon=float(self.params.simplify_eps),
+                closed=closed
+            )
+
             pts = approx.reshape(-1, 2).astype(np.int32)
-            if pts.shape[0] >= max(10, int(self.params.min_contour_len) // 8):
+
+            # For simple shapes like square, 4 points is enough
+            if pts.shape[0] >= 2:
+                # If closed shape, add first point again so plotter closes it
+                if closed and not np.array_equal(pts[0], pts[-1]):
+                    pts = np.vstack([pts, pts[0]])
+
                 polylines.append(pts)
+
         return polylines
 
     @staticmethod
